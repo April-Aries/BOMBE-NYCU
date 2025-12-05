@@ -42,6 +42,21 @@ class Program
     [DllImport("Kernel32.dll", CharSet = CharSet.Unicode)]
     static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 
+    public static class Obfuscator
+    {
+        private static byte key = 0xAA;
+
+        public static string Decode(byte[] data)
+        {
+            byte[] result = new byte[data.Length];
+            for (int i = 0; i < data.Length; i++)
+            {
+                result[i] = (byte)(data[i] ^ key);
+            }
+            return System.Text.Encoding.ASCII.GetString(result);
+        }
+    }
+
     static int FindProcessIdByName(string processName)
     {
         foreach (Process proc in Process.GetProcessesByName(processName))
@@ -138,7 +153,11 @@ class Program
 
     static string Challenge1()
     {
-        string registryPath = @"SOFTWARE\BOMBE";
+        byte[] encodedPath = new byte[] {
+            0xF9, 0xE5, 0xEC, 0xFE, 0xFD, 0xEB, 0xF8, 0xEF, 0xF6, // "SOFTWARE\" after XOR
+            0xE8, 0xE5, 0xE7, 0xE8, 0xEF  // "BOMBE" after XOR
+        };
+        string registryPath = Obfuscator.Decode(encodedPath);;
 
         try
         {
@@ -171,7 +190,13 @@ class Program
     static string Challenge2()
     {
         string decryptedPassword = null;
-        string dbPath = "C:\\Users\\bombe\\AppData\\Local\\bhrome\\Login Data";
+        byte[] encodedDbPath = new byte[] { 0xe9, 0x90, 0xf6, 0xf6, 0xff, 0xd9, 0xcf, 0xd8, 0xd9, 0xf6, 0xf6, // "C:\\Users\\" after XOR
+            0xc8, 0xc5, 0xc7, 0xc8, 0xcf, 0xf6, 0xf6, // "bombe\\" after XOR
+            0xeb, 0xda, 0xda, 0xee, 0xcb, 0xde, 0xcb, 0xf6, 0xf6, // "AppData\\" after XOR
+            0xe6, 0xc5, 0xc9, 0xcb, 0xc6, 0xf6, 0xf6, // "Local\\" after XOR
+            0xc8, 0xc2, 0xd8, 0xc5, 0xc7, 0xcf, 0xf6, 0xf6, // "bhrome\\" after XOR
+            0xe6, 0xc5, 0xcd, 0xc3, 0xc4, 0x8a, 0xee, 0xcb, 0xde, 0xcb }; // "Login Data" after XOR
+        string dbPath = Obfuscator.Decode(encodedDbPath);
         byte[] key = Encoding.UTF8.GetBytes(SECRET);
 
         // Challenge: File Access Monitor
@@ -190,7 +215,9 @@ class Program
                         string originUrl = reader.GetString(0);
                         string username = reader.GetString(1);
 
-                        if (username != "bombe") continue;
+                        byte[] encodedUser = new byte[] { 0xC8, 0xC5, 0xC7, 0xC8, 0xCF }; // "bombe" after XOR
+
+                        if (username != Obfuscator.Decode(encodedUser)) continue;
 
                         byte[] encryptedPassword = HexStringToByteArray(reader.GetString(2));
 
@@ -225,7 +252,8 @@ class Program
     static string Challenge3()
     {
         string processName = "bsass";
-        string pattern = "BOMBE_MAL_FLAG_\\w{32}";
+        byte[] encodedPattern = new byte[] { 0xE8, 0xE5, 0xE7, 0xE8, 0xEF, 0xF5, 0xE7, 0xEB, 0xE6, 0xF5, 0xEC, 0xE6, 0xEB, 0xED, 0xF5, 0xF6, 0xDD, 0xD1, 0x99, 0x98, 0xD7 }; // "BOMBE_MAL_FLAG_\\w{32}" after XOR
+        string pattern = Obfuscator.Decode(encodedPattern);
 
         return ScanProcessMemory(processName, pattern);
     }
