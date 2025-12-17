@@ -13,7 +13,8 @@ namespace EDRPOC
 {
     internal class Program
     {
-        const string SECRET = "0000";
+        const string SECRET = "00000000000000000000000000000000";
+        
 
         // Dictionary to store process ID to executable filename mapping
         private static Dictionary<int, string> processIdToExeName = new Dictionary<int, string>();
@@ -34,13 +35,16 @@ namespace EDRPOC
                     KernelTraceEventParser.Keywords.Process |
                     KernelTraceEventParser.Keywords.DiskFileIO |
                     KernelTraceEventParser.Keywords.FileIOInit |
-                    KernelTraceEventParser.Keywords.FileIO
+                    KernelTraceEventParser.Keywords.FileIO |
+                    KernelTraceEventParser.Keywords.Registry
                 );
 
                 kernelSession.Source.Kernel.ProcessStart += processStartedHandler;
                 kernelSession.Source.Kernel.ProcessStop += processStoppedHandler;
                 kernelSession.Source.Kernel.FileIORead += fileReadHandler;
                 kernelSession.Source.Kernel.ImageLoad += imageLoadHandler;
+                //kernelSession.Source.Kernel.RegistryQueryValue += registryQueryHandler;
+                kernelSession.Source.Kernel.RegistryOpen += registryOpenHandler;
 
 
                 kernelSession.Source.Process();
@@ -57,12 +61,44 @@ namespace EDRPOC
 
             return path.StartsWith(system32.ToLower()) || path.StartsWith(syswow64.ToLower());
         }
+        private static bool IsTargetMalwareProcess(string imageNameOrPath)
+        {
+            if (string.IsNullOrEmpty(imageNameOrPath)) return false;
+            string fileName = Path.GetFileName(imageNameOrPath);
 
+            return fileName.StartsWith("BOMBE_EDR_FLAG_", StringComparison.OrdinalIgnoreCase);
+        }
         private static void imageLoadHandler(ImageLoadTraceData data)
         {
+            if (!data.FileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
             lock (processToImagePath)
             {
-                processToImagePath[data.ProcessID] = data.FileName;
+                // 防止dll覆蓋掉.exe路徑
+                if (processToImagePath.TryGetValue(data.ProcessID, out string existingPath))
+                {
+                    if (!string.IsNullOrEmpty(existingPath) &&
+                        existingPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+                }
+
+                // 只有當載入的檔名跟 Process 名稱吻合時才記錄
+                lock (processIdToExeName)
+                {
+                    if (processIdToExeName.TryGetValue(data.ProcessID, out string shortName))
+                    {
+                        if (!string.IsNullOrEmpty(shortName) &&
+                            data.FileName.EndsWith(shortName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            processToImagePath[data.ProcessID] = data.FileName;
+                        }
+                    }
+                    else
+                    {
+                        processToImagePath[data.ProcessID] = data.FileName;
+                    }
+                }
             }
         }
         private static void processStartedHandler(ProcessTraceData data)
@@ -103,7 +139,7 @@ namespace EDRPOC
                     {
                         string fullFilePath = null;
                         lock (processToImagePath) { processToImagePath.TryGetValue(root, out fullFilePath); }
-                        if (!IsTrustedSystemLocation(fullFilePath))
+                        if (IsTargetMalwareProcess(fullFilePath))
                         {
                             // classified to malware
                             string exeName = null;
@@ -115,6 +151,9 @@ namespace EDRPOC
                             // Send the executable filename to the server
                             if (!string.IsNullOrEmpty(exeName))
                             {
+                                // Set the flag to true to disable further handling
+                                answerSent = true;
+
                                 await SendAnswerToServer(JsonConvert.SerializeObject(
                                     new
                                     {
@@ -123,8 +162,6 @@ namespace EDRPOC
                                     }
                                 ));
 
-                                // Set the flag to true to disable further handling
-                                answerSent = true;
                             }
                             break;
                         }
@@ -135,6 +172,57 @@ namespace EDRPOC
             catch (Exception ex)
             {
                 Console.WriteLine($"[Error in fileReadHandler] {ex.Message}");
+                Console.WriteLine(ex.StackTrace);
+            }
+        }
+        private static async void registryOpenHandler(RegistryTraceData data)
+        {
+            try
+            {
+                // Check if the answer has already been sent
+                if (answerSent) return;
+
+                if (!string.IsNullOrEmpty(data.KeyName) && data.KeyName.ToUpper().Contains("SOFTWARE\\BOMBE"))
+                {
+                    // root backtracking
+                    int root = data.ProcessID;
+                    while (true)
+                    {
+                        string fullFilePath = null;
+                        lock (processToImagePath) { processToImagePath.TryGetValue(root, out fullFilePath); }
+                        if (IsTargetMalwareProcess(fullFilePath))
+                        {
+                            // classified to malware
+                            string exeName = null;
+                            lock (processIdToExeName) { processIdToExeName.TryGetValue(root, out exeName); }
+                            Console.WriteLine("Key read: {0},\nprocess: {1}", data.KeyName, data.ProcessName);
+                            Console.WriteLine("Real malware: {0},\nwith pid {1},\nimagePath: {2}", exeName, root, fullFilePath);
+                            Console.WriteLine("------------------------------------------------------");
+
+                            // Send the executable filename to the server
+                            if (!string.IsNullOrEmpty(exeName))
+                            {
+                                // Set the flag to true to disable further handling
+                                answerSent = true;
+
+                                await SendAnswerToServer(JsonConvert.SerializeObject(
+                                    new
+                                    {
+                                        answer = exeName,
+                                        secret = SECRET
+                                    }
+                                ));
+
+                            }
+                            break;
+                        }
+                        lock (childToParent) { childToParent.TryGetValue(root, out root); }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Error in registryQueryHandler] {ex.Message}");
                 Console.WriteLine(ex.StackTrace);
             }
         }
