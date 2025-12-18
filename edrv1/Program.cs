@@ -11,12 +11,150 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Text;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace EDRPOC
 {
+    public class SignatureRule
+    {
+        public string RuleName { get; set; }
+        public byte[] Pattern { get; set; }
+
+        public SignatureRule(string name, byte[] pattern)
+        {
+            RuleName = name;
+            Pattern = pattern;
+        }
+    }
+    public static class MemoryScanner
+    {
+        const int PROCESS_QUERY_INFORMATION = 0x0400;
+        const int PROCESS_VM_READ = 0x0010;
+        const int MEM_COMMIT = 0x1000;
+        const int PAGE_READWRITE = 0x04;
+        const int PAGE_EXECUTE_READWRITE = 0x40;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, IntPtr nSize, out IntPtr lpNumberOfBytesRead);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, IntPtr dwLength);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        public static List<SignatureRule> LoadRules()
+        {
+            var rules = new List<SignatureRule>();
+
+            // Rule 1: Plaintext "BOMBE"
+            rules.Add(new SignatureRule("Plain_BOMBE", Encoding.ASCII.GetBytes("BOMBE")));
+
+            // Rule 2: Base*
+            rules.Add(new SignatureRule("Base32_BOMBE", Encoding.ASCII.GetBytes("IJHU2QSF")));
+            rules.Add(new SignatureRule("Base45_BOMBE", Encoding.ASCII.GetBytes("AH8NY9O1")));
+            rules.Add(new SignatureRule("Base58_BOMBE", Encoding.ASCII.GetBytes("8Uuekoe")));
+            rules.Add(new SignatureRule("Base62_BOMBE", Encoding.ASCII.GetBytes("50rwf7l")));
+            rules.Add(new SignatureRule("Base64_BOMBE", Encoding.ASCII.GetBytes("Qk9NQkU")));
+            rules.Add(new SignatureRule("Base85_BOMBE", Encoding.ASCII.GetBytes("6;L<B70")));
+            rules.Add(new SignatureRule("Base92_BOMBE", Encoding.ASCII.GetBytes("9>u1%3B")));
+
+            // Rule 3: TODO: XOR (Key 0x??)
+
+            // Rule 4: WideChar
+            rules.Add(new SignatureRule("Wide_BOMBE", Encoding.Unicode.GetBytes("BOMBE")));
+
+            return rules;
+        }
+
+        // 簡單的 Boyer-Moore 或 IndexOf 搜尋
+        private static int FindPattern(byte[] buffer, int bytesRead, byte[] pattern)
+        {
+            if (bytesRead < pattern.Length) return -1;
+
+            for (int i = 0; i <= bytesRead - pattern.Length; i++)
+            {
+                bool found = true;
+                for (int j = 0; j < pattern.Length; j++)
+                {
+                    if (buffer[i + j] != pattern[j])
+                    {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return i;
+            }
+            return -1;
+        }
+
+        public static string Scan(int pid)
+        {
+            List<SignatureRule> rules = LoadRules();
+            IntPtr hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+
+            if (hProcess == IntPtr.Zero) return null;
+
+            try
+            {
+                IntPtr address = IntPtr.Zero;
+                MEMORY_BASIC_INFORMATION mbi;
+
+                // 遍歷記憶體區段
+                while (VirtualQueryEx(hProcess, address, out mbi, (IntPtr)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))) != IntPtr.Zero)
+                {
+                    // 為了效能，只掃描已提交 (Commit) 且可讀寫 (RW/RWE) 的記憶體
+                    // 注意：C# 字串有時會在 ReadOnly 區段，視情況可放寬條件
+                    if (mbi.State == MEM_COMMIT &&
+                       (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE))
+                    {
+                        byte[] buffer = new byte[(long)mbi.RegionSize];
+                        if (ReadProcessMemory(hProcess, address, buffer, mbi.RegionSize, out IntPtr bytesRead))
+                        {
+                            // 對每個 Rule 進行比對
+                            foreach (var rule in rules)
+                            {
+                                if (FindPattern(buffer, (int)bytesRead, rule.Pattern) != -1)
+                                {
+                                    return rule.RuleName; // 抓到了！回傳規則名稱
+                                }
+                            }
+                        }
+                    }
+                    // 移動到下一個區段
+                    long nextAddress = (long)address + (long)mbi.RegionSize;
+                    address = new IntPtr(nextAddress);
+                }
+            }
+            catch { }
+            finally
+            {
+                CloseHandle(hProcess);
+            }
+
+            return null;
+        }
+    }
     internal class Program
     {
-        const string SECRET = "00000000000000000000000000000000";
+        //const string SECRET = "00000000000000000000000000000000"; 
+        const string SECRET = "uuKVJRNSR89m3Uvpmf8PrI8OnFKyTjHh";
+
 
 
         // --- File ID Helper (No changes needed here, kept for completeness) ---
@@ -57,6 +195,7 @@ namespace EDRPOC
         private static Dictionary<int, string> processIdToExeName = new Dictionary<int, string>();
         private static Dictionary<int, int> childToParent = new Dictionary<int, int>();
         private static Dictionary<int, string> processToImagePath = new Dictionary<int, string>();
+        private static HashSet<int> scannedPids = new HashSet<int>(); // 避免重複掃描同一 PID
 
         // [NEW] Behavior Tracking
         enum BehaviorType { FileAccess, RegistryAccess, MemoryScan }
@@ -76,6 +215,10 @@ namespace EDRPOC
             {
                 using (var kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName))
                 {
+                    Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs e) { kernelSession.Dispose(); };
+
+                    Task.Run(() => ScanLoop());
+
                     Console.CancelKeyPress += delegate { kernelSession.Dispose(); };
                     kernelSession.EnableKernelProvider(
                         KernelTraceEventParser.Keywords.ImageLoad |
@@ -93,20 +236,42 @@ namespace EDRPOC
                     kernelSession.Source.Process();
                 }
             });
-
-            // Start Object Manager Session (Memory/Handle)
-            var obTask = Task.Run(() =>
-            {
-                using (var obSession = new TraceEventSession("MyEDR_ObSession"))
-                {
-                    obSession.EnableProvider(new Guid("222962ab-6180-4b88-a825-346b75f2a248"), TraceEventLevel.Informational, 0x20);
-                    obSession.Source.Dynamic.All += obHandleHandler;
-                    obSession.Source.Process();
-                }
-            });
-
-            await Task.WhenAll(kernelTask, obTask);
+            await kernelTask;
         }
+
+        private static void ScanLoop()
+        {
+            while (!answerSent)
+            {
+                List<int> pidsSnapshot;
+                lock (processIdToExeName)
+                {
+                    pidsSnapshot = new List<int>(processIdToExeName.Keys);
+                }
+
+                foreach (int pid in pidsSnapshot)
+                {
+                    if (scannedPids.Contains(pid)) continue;
+
+                    string detection = MemoryScanner.Scan(pid);
+                    if (detection != null)
+                    {
+                        Console.WriteLine($"[ALERT] Malicious Pattern '{detection}' found in PID: {pid}");
+
+                        RecordAndCheckMalware(
+                            pid,
+                            BehaviorType.MemoryScan,
+                            $"Memory pattern: {detection}"
+                        );
+                    }
+
+                    scannedPids.Add(pid);
+                }
+
+                Thread.Sleep(1000);
+            }
+        }
+
 
         // --- Logic to Correlate Behaviors ---
         private static void RecordAndCheckMalware(int sourcePid, BehaviorType type, string details)
@@ -141,7 +306,7 @@ namespace EDRPOC
                         }
 
                         // === DECISION LOGIC: 2 or more distinct behaviors ===
-                        if (processBehaviors[root].Count >= 4)
+                        if (processBehaviors[root].Count >= 2)
                         {
                             string exeName = null;
                             lock (processIdToExeName) { processIdToExeName.TryGetValue(root, out exeName); }
@@ -166,42 +331,6 @@ namespace EDRPOC
                 lock (childToParent) { hasParent = childToParent.TryGetValue(root, out parentId); }
                 if (!hasParent || parentId == root || parentId == 0) break;
                 root = parentId;
-            }
-        }
-
-        // --- Handlers ---
-
-        private static void obHandleHandler(TraceEvent data)
-        {
-            if (answerSent) return;
-
-            Console.WriteLine($"有進 obHandleHandler");
-
-            // 雖然我們主要想抓 "ObHandle/Create"，但有時候事件名稱會有些微差異
-            // 建議檢查 Event ID 或名稱包含 "Handle"
-            if (data.EventName.Contains("ObHandle/Create") || data.EventName.Contains("HandleCreate"))
-            {
-                // [修正] 使用 PayloadByName 並轉成 String
-                string objectName = data.PayloadByName("ObjectName")?.ToString();
-                string objectType = data.PayloadByName("ObjectType")?.ToString();
-
-                // 有時候 Payload 會是空的，或是回傳 null，所以要檢查
-                if (string.IsNullOrEmpty(objectName) || string.IsNullOrEmpty(objectType))
-                {
-                    return;
-                }
-
-                // 偵測邏輯：類型是 Process 且 名稱包含 bsass
-                if (objectType == "Process" && objectName.ToLower().Contains("bsass"))
-                {
-                    // 排除 bsass 自己存取自己 (PID 檢查)
-                    if (objectName.Contains(data.ProcessID.ToString())) return;
-
-                    Console.WriteLine($"[OB Handle] PID {data.ProcessID} accessed bsass handle: {objectName}");
-
-                    // 呼叫您的回報邏輯
-                    RecordAndCheckMalware(data.ProcessID, BehaviorType.MemoryScan, $"Accessed bsass Handle ({objectName})");
-                }
             }
         }
 
@@ -262,7 +391,7 @@ namespace EDRPOC
             }
         }
 
-        private static void processStartedHandler(ProcessTraceData data)
+        private static async void processStartedHandler(ProcessTraceData data)
         {
             lock (processIdToExeName) { processIdToExeName[data.ProcessID] = data.ImageFileName; }
             lock (childToParent) { childToParent[data.ProcessID] = data.ParentID; }
