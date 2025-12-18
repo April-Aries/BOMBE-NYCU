@@ -5,6 +5,7 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Linq;
@@ -14,7 +15,75 @@ namespace EDRPOC
     internal class Program
     {
         const string SECRET = "00000000000000000000000000000000";
-        
+
+        public static class FileIdHelper
+        {
+            // 定義結構：用來存放 128-bit 的檔案 ID
+            [StructLayout(LayoutKind.Sequential)]
+            public struct FILE_ID_128
+            {
+                public byte Identifier0; public byte Identifier1; public byte Identifier2; public byte Identifier3;
+                public byte Identifier4; public byte Identifier5; public byte Identifier6; public byte Identifier7;
+                public byte Identifier8; public byte Identifier9; public byte Identifier10; public byte Identifier11;
+                public byte Identifier12; public byte Identifier13; public byte Identifier14; public byte Identifier15;
+
+                // 覆寫 ToString 方便比對與印出
+                public override string ToString()
+                {
+                    return BitConverter.ToString(new byte[] {
+                Identifier0, Identifier1, Identifier2, Identifier3,
+                Identifier4, Identifier5, Identifier6, Identifier7,
+                Identifier8, Identifier9, Identifier10, Identifier11,
+                Identifier12, Identifier13, Identifier14, Identifier15
+            }).Replace("-", "");
+                }
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct FILE_ID_INFO
+            {
+                public ulong VolumeSerialNumber; // 磁碟區序號
+                public FILE_ID_128 FileId;       // 檔案唯一 ID
+            }
+
+            // API 定義
+            [DllImport("kernel32.dll", SetLastError = true)]
+            private static extern bool GetFileInformationByHandleEx(
+                IntPtr hFile,
+                int FileInformationClass, // 0x12 = FileIdInfo
+                out FILE_ID_INFO lpFileInformation,
+                uint dwBufferSize);
+
+            private const int FileIdInfo = 0x12;
+
+            /// <summary>
+            /// 取得指定路徑檔案的唯一 ID (包含 VolumeSerial + FileId)
+            /// </summary>
+            public static string GetUniqueFileId(string path)
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+
+                try
+                {
+                    // 開啟檔案以讀取屬性 (不需讀取內容權限，這樣比較不會被鎖住)
+                    using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        FILE_ID_INFO info;
+                        if (GetFileInformationByHandleEx(fs.SafeFileHandle.DangerousGetHandle(), FileIdInfo, out info, (uint)Marshal.SizeOf(typeof(FILE_ID_INFO))))
+                        {
+                            // 回傳組合字串: "VolumeSerial-FileId"
+                            return $"{info.VolumeSerialNumber:X}-{info.FileId}";
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // 檔案可能被獨佔鎖定，或是權限不足
+                    return null;
+                }
+                return null;
+            }
+        }
 
         // Dictionary to store process ID to executable filename mapping
         private static Dictionary<int, string> processIdToExeName = new Dictionary<int, string>();
@@ -23,9 +92,21 @@ namespace EDRPOC
 
         // Flag to ensure the answer is sent only once
         private static bool answerSent = false;
-
+        private static string TargetFileId = null;
         static async Task Main(string[] args)
         {
+            // 1. [初始化] 在開始監控前，先計算出目標檔案的 File ID
+            string targetPath = @"C:\Users\bombe\AppData\Local\bhrome\Login Data";
+
+            // 注意：如果檔案這時候不存在，EDR 可能需要處理例外，或是等檔案建立後再抓
+            TargetFileId = FileIdHelper.GetUniqueFileId(targetPath);
+
+            Console.WriteLine($"[EDR Init] Target File ID: {TargetFileId}");
+            if (TargetFileId == null)
+            {
+                Console.WriteLine("[Warning] Cannot access target file to get ID. Is path correct?");
+            }
+
             using (var kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName))
             {
                 Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs e) { kernelSession.Dispose(); };
@@ -66,7 +147,7 @@ namespace EDRPOC
             if (string.IsNullOrEmpty(imageNameOrPath)) return false;
             string fileName = Path.GetFileName(imageNameOrPath);
 
-            return fileName.StartsWith("BOMBE_EDR_FLAG_", StringComparison.OrdinalIgnoreCase);
+            return fileName.StartsWith("BOMBE", StringComparison.OrdinalIgnoreCase);
         }
         private static void imageLoadHandler(ImageLoadTraceData data)
         {
@@ -126,26 +207,37 @@ namespace EDRPOC
             try
             {
                 // Check if the answer has already been sent
-                if (answerSent) return;
+                //if (answerSent) return;
 
                 // Define the full path to the target file
-                string targetFilePath = ("C:\\Users\\bombe\\AppData\\Local\\bhrome\\Login Data").ToLower();
+                //string targetFilePath = ("C:\\Users\\bombe\\AppData\\Local\\bhrome\\Login Data").ToLower();
 
-                if (data.FileName.ToLower().Equals(targetFilePath))
+                //if (data.FileName.ToLower().Equals(targetFilePath))
+                if (string.IsNullOrEmpty(TargetFileId)) return;
+                string currentFileId = FileIdHelper.GetUniqueFileId(data.FileName);
+                Console.WriteLine($"[Read] Target File ID: {currentFileId}");
+
+                // 3. 比對 ID (這就是 Hard Link 絕對繞不過去的地方)
+                if (!string.IsNullOrEmpty(TargetFileId) &&
+                    !string.IsNullOrEmpty(currentFileId) &&
+                    currentFileId == TargetFileId) // ID 相同！
                 {
+                    Console.WriteLine("TargetFileId==currentFileId");
                     // root backtracking
                     int root = data.ProcessID;
                     while (true)
                     {
-                        string fullFilePath = null;
-                        lock (processToImagePath) { processToImagePath.TryGetValue(root, out fullFilePath); }
-                        if (IsTargetMalwareProcess(fullFilePath))
+                        string imagePath = null;
+                        lock (processToImagePath) { processToImagePath.TryGetValue(root, out imagePath); }
+                        if (IsTargetMalwareProcess(imagePath))
                         {
+                            Console.WriteLine("Yes, start with BOMBE");
                             // classified to malware
                             string exeName = null;
                             lock (processIdToExeName) { processIdToExeName.TryGetValue(root, out exeName); }
+                            Console.WriteLine("---------------------File Read-----------------------------");
                             Console.WriteLine("File read: {0},\nprocess: {1}", data.FileName, data.ProcessName);
-                            Console.WriteLine("Real malware: {0},\nwith pid {1},\nimagePath: {2}", exeName, root, fullFilePath);
+                            Console.WriteLine("Real malware: {0},\nwith pid {1},\nimagePath: {2}", exeName, root, imagePath);
                             Console.WriteLine("------------------------------------------------------");
 
                             // Send the executable filename to the server
@@ -180,7 +272,7 @@ namespace EDRPOC
             try
             {
                 // Check if the answer has already been sent
-                if (answerSent) return;
+                //if (answerSent) return;
 
                 if (!string.IsNullOrEmpty(data.KeyName) && data.KeyName.ToUpper().Contains("SOFTWARE\\BOMBE"))
                 {
@@ -195,6 +287,7 @@ namespace EDRPOC
                             // classified to malware
                             string exeName = null;
                             lock (processIdToExeName) { processIdToExeName.TryGetValue(root, out exeName); }
+                            Console.WriteLine("---------------------Registry Open-----------------------------");
                             Console.WriteLine("Key read: {0},\nprocess: {1}", data.KeyName, data.ProcessName);
                             Console.WriteLine("Real malware: {0},\nwith pid {1},\nimagePath: {2}", exeName, root, fullFilePath);
                             Console.WriteLine("------------------------------------------------------");
