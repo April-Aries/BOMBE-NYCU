@@ -33,6 +33,17 @@
 
 * Challenge File Access Monitor: Using hard link
 * Challenge Process Memory Scan: XOR strings containing "BOMBE"
+* Process Injection
+  * Malware-dll: build the dll version of malware program (main logic)
+  * Using [TheWover/donut](https://github.com/TheWover/donut) to generate shellcode in binary
+    ```
+     .\donut.exe -i /PATH/TO/Malware.dll -c Malware_dll.Program -m Run -o shellcode.bin
+    ```
+  * Using utilities/shellcodeConverter.py transform the binary shellcode to hex format
+    ```
+    python3 .\converter.py /PATH/TO/shellcode.bin > shellcode
+    ```
+  * Malware-ProcessInjection: inject the shellcode to bsass.exe
 
 ### EDR
 
