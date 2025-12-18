@@ -13,6 +13,8 @@
 |   |   └─PublishProfiles
 |   ├─Program.cs            # Malware code
 |   └─malware.csproj
+├─utilities
+|   └─shellodeConverter.py  # Convert dll shellcode made from donut to hex format
 ├─.gitignore
 ├─README.md
 └─bombe-poc.sln
