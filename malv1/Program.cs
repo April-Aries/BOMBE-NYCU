@@ -251,7 +251,8 @@ class Program
 
     static string Challenge3()
     {
-        string processName = "bsass";
+        byte[] encodedProcessName = new byte[] { 0xc8, 0xd9, 0xcb, 0xd9, 0xd9 }; //  "bsass" after XOR
+        string processName = Obfuscator.Decode(encodedProcessName);
         byte[] encodedPattern = new byte[] { 0xE8, 0xE5, 0xE7, 0xE8, 0xEF, 0xF5, 0xE7, 0xEB, 0xE6, 0xF5, 0xEC, 0xE6, 0xEB, 0xED, 0xF5, 0xF6, 0xDD, 0xD1, 0x99, 0x98, 0xD7 }; // "BOMBE_MAL_FLAG_\\w{32}" after XOR
         string pattern = Obfuscator.Decode(encodedPattern);
 
