@@ -34,4 +34,10 @@
 
 ### EDR
 
-* Challenge Bypass File Access Monitor: Trace process "cmd.exe" with `copy` and `login data` arguments
+* Challenge Bypass File Access Monitor: Trace process "cmd.exe" by parent-child relationship
+* Distinguish Decoys: Using parent-child relationship backtracking and behavior analysis
+* Monitor Registry Read: Using ETW to monitor RegistryOpen
+* Monitor File Read: Using ETW to monitor FileIORead with fileID recognition
+* Monitor Process Memory Read: Scan each process's memory space with simple static rules once new process is created
+* To compile EDR in Visual Studio: 
+	> Right-Click EDR Project -> Publish -> Select Target Folder -> Publish
