@@ -1,15 +1,19 @@
-﻿using Microsoft.Diagnostics.Tracing.Parsers;
+﻿using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Text;
 using System.Threading.Tasks;
+using System.Threading;
 
-namespace edr
+namespace EDRPOC
 {
     public class SignatureRule
     {
@@ -148,40 +152,94 @@ namespace edr
     }
     internal class Program
     {
-        const string SECRET = "00000000000000000000000000000000";
+        //const string SECRET = "00000000000000000000000000000000"; 
+        const string SECRET = "uuKVJRNSR89m3Uvpmf8PrI8OnFKyTjHh";
 
-        // Dictionary to store process ID to executable filename mapping
-        private static Dictionary<int, string> processIdToExeName = new Dictionary<int, string>();
-        private static HashSet<int> scannedPids = new HashSet<int>(); // 避免重複掃描同一 PID
 
-        // Flag to ensure the answer is sent only once
-        private static bool answerSent = false;
 
-        static async Task Main(string[] args)
+        // --- File ID Helper (No changes needed here, kept for completeness) ---
+        public static class FileIdHelper
         {
-            using (var kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName))
+            [StructLayout(LayoutKind.Sequential)]
+            public struct FILE_ID_128
             {
-                Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs e) { kernelSession.Dispose(); };
-
-                Task.Run(() => ScanLoop());
-
-                kernelSession.EnableKernelProvider(
-                    KernelTraceEventParser.Keywords.ImageLoad |
-                    KernelTraceEventParser.Keywords.Process |
-                    KernelTraceEventParser.Keywords.DiskFileIO |
-                    KernelTraceEventParser.Keywords.FileIOInit |
-                    KernelTraceEventParser.Keywords.FileIO
-                );
-
-                kernelSession.Source.Kernel.ProcessStart += processStartedHandler;
-                kernelSession.Source.Kernel.ProcessStop += processStoppedHandler;
-                kernelSession.Source.Kernel.FileIORead += fileReadHandler;
-
-                kernelSession.Source.Process();
+                public byte Identifier0; public byte Identifier1; public byte Identifier2; public byte Identifier3;
+                public byte Identifier4; public byte Identifier5; public byte Identifier6; public byte Identifier7;
+                public byte Identifier8; public byte Identifier9; public byte Identifier10; public byte Identifier11;
+                public byte Identifier12; public byte Identifier13; public byte Identifier14; public byte Identifier15;
+                public override string ToString() => BitConverter.ToString(new byte[] { Identifier0, Identifier1, Identifier2, Identifier3, Identifier4, Identifier5, Identifier6, Identifier7, Identifier8, Identifier9, Identifier10, Identifier11, Identifier12, Identifier13, Identifier14, Identifier15 }).Replace("-", "");
+            }
+            [StructLayout(LayoutKind.Sequential)]
+            public struct FILE_ID_INFO { public ulong VolumeSerialNumber; public FILE_ID_128 FileId; }
+            [DllImport("kernel32.dll", SetLastError = true)]
+            private static extern bool GetFileInformationByHandleEx(IntPtr hFile, int FileInformationClass, out FILE_ID_INFO lpFileInformation, uint dwBufferSize);
+            private const int FileIdInfo = 0x12;
+            public static string GetUniqueFileId(string path)
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+                try
+                {
+                    using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        FILE_ID_INFO info;
+                        if (GetFileInformationByHandleEx(fs.SafeFileHandle.DangerousGetHandle(), FileIdInfo, out info, (uint)Marshal.SizeOf(typeof(FILE_ID_INFO))))
+                            return $"{info.VolumeSerialNumber:X}-{info.FileId}";
+                    }
+                }
+                catch { return null; }
+                return null;
             }
         }
 
-        private static async void ScanLoop()
+        // --- Global State ---
+        private static Dictionary<int, string> processIdToExeName = new Dictionary<int, string>();
+        private static Dictionary<int, int> childToParent = new Dictionary<int, int>();
+        private static Dictionary<int, string> processToImagePath = new Dictionary<int, string>();
+        private static HashSet<int> scannedPids = new HashSet<int>(); // 避免重複掃描同一 PID
+
+        // [NEW] Behavior Tracking
+        enum BehaviorType { FileAccess, RegistryAccess, MemoryScan }
+        private static Dictionary<int, HashSet<BehaviorType>> processBehaviors = new Dictionary<int, HashSet<BehaviorType>>();
+
+        private static bool answerSent = false;
+        private static string TargetFileId = null;
+
+        static async Task Main(string[] args)
+        {
+            string targetPath = @"C:\Users\bombe\AppData\Local\bhrome\Login Data";
+            TargetFileId = FileIdHelper.GetUniqueFileId(targetPath);
+            Console.WriteLine($"[EDR Init] Target File ID: {TargetFileId ?? "NOT FOUND"}");
+
+            // Start Kernel Session (File, Reg, Process)
+            var kernelTask = Task.Run(() =>
+            {
+                using (var kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName))
+                {
+                    Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs e) { kernelSession.Dispose(); };
+
+                    Task.Run(() => ScanLoop());
+
+                    Console.CancelKeyPress += delegate { kernelSession.Dispose(); };
+                    kernelSession.EnableKernelProvider(
+                        KernelTraceEventParser.Keywords.ImageLoad |
+                        KernelTraceEventParser.Keywords.Process |
+                        KernelTraceEventParser.Keywords.DiskFileIO |
+                        KernelTraceEventParser.Keywords.FileIOInit |
+                        KernelTraceEventParser.Keywords.FileIO |
+                        KernelTraceEventParser.Keywords.Registry
+                    );
+                    kernelSession.Source.Kernel.ProcessStart += processStartedHandler;
+                    kernelSession.Source.Kernel.ProcessStop += processStoppedHandler;
+                    kernelSession.Source.Kernel.FileIORead += fileReadHandler;
+                    kernelSession.Source.Kernel.ImageLoad += imageLoadHandler;
+                    kernelSession.Source.Kernel.RegistryOpen += registryOpenHandler;
+                    kernelSession.Source.Process();
+                }
+            });
+            await kernelTask;
+        }
+
+        private static void ScanLoop()
         {
             while (!answerSent)
             {
@@ -195,21 +253,16 @@ namespace edr
                 {
                     if (scannedPids.Contains(pid)) continue;
 
-                    // 執行掃描
                     string detection = MemoryScanner.Scan(pid);
                     if (detection != null)
                     {
-                        string exeName = "";
-                        lock (processIdToExeName) { processIdToExeName.TryGetValue(pid, out exeName); }
+                        Console.WriteLine($"[ALERT] Malicious Pattern '{detection}' found in PID: {pid}");
 
-                        Console.WriteLine($"[ALERT] Malicious Pattern '{detection}' found in PID: {pid} ({exeName})");
-
-                        if (!string.IsNullOrEmpty(exeName))
-                        {
-                            await SendAnswerToServer(JsonConvert.SerializeObject(new { answer = exeName, secret = SECRET }));
-                            answerSent = true;
-                            return;
-                        }
+                        RecordAndCheckMalware(
+                            pid,
+                            BehaviorType.MemoryScan,
+                            $"Memory pattern: {detection}"
+                        );
                     }
 
                     scannedPids.Add(pid);
@@ -219,99 +272,150 @@ namespace edr
             }
         }
 
-        private static async void processStartedHandler(ProcessTraceData data)
+
+        // --- Logic to Correlate Behaviors ---
+        private static void RecordAndCheckMalware(int sourcePid, BehaviorType type, string details)
         {
-            lock (processIdToExeName)
-            {
-                processIdToExeName[data.ProcessID] = data.ImageFileName;
-            }
+            if (answerSent) return;
 
-            // Challenge: Bypass File Access Monitor
-            if (!answerSent && data.ParentID != 0 && processIdToExeName.TryGetValue(data.ParentID, out var parentName))
+            // 1. Backtrack to find the ROOT process (BOMBE...)
+            int root = sourcePid;
+            int safetyCount = 0;
+
+            while (safetyCount < 50)
             {
-                if (data.ImageFileName.ToLower() == "cmd.exe")
+                safetyCount++;
+                string fullFilePath = null;
+                lock (processToImagePath) { processToImagePath.TryGetValue(root, out fullFilePath); }
+
+                if (IsTargetMalwareProcess(fullFilePath))
                 {
-                    var args = data.CommandLine?.ToLower();
-                    if (args != null && args.Contains("copy") && args.Contains("login data"))
+                    // Found a BOMBE candidate
+                    lock (processBehaviors)
                     {
-                        Console.WriteLine("Copy command: {0}, process: {1} with pid {2}, parent process: {3}", data.CommandLine, data.ProcessName, data.ProcessID, parentName);
-                        await SendAnswerToServer(JsonConvert.SerializeObject(
-                            new
-                            {
-                                answer = parentName,
-                                secret = SECRET
-                            }
-                        ));
+                        if (!processBehaviors.ContainsKey(root))
+                        {
+                            processBehaviors[root] = new HashSet<BehaviorType>();
+                            Console.WriteLine($"[Tracking] Process {root} ({Path.GetFileName(fullFilePath)}) started suspicious activity.");
+                        }
 
-                        // Set the flag to true to disable further handling
-                        answerSent = true;
+                        // Add the behavior type
+                        if (processBehaviors[root].Add(type))
+                        {
+                            Console.WriteLine($"   + Behavior Added: {type} | {details}");
+                        }
+
+                        // === DECISION LOGIC: 2 or more distinct behaviors ===
+                        if (processBehaviors[root].Count >= 2)
+                        {
+                            string exeName = null;
+                            lock (processIdToExeName) { processIdToExeName.TryGetValue(root, out exeName); }
+                            if (string.IsNullOrEmpty(exeName)) exeName = Path.GetFileName(fullFilePath);
+
+                            Console.WriteLine("\n=======================================================");
+                            Console.WriteLine(" ALARM: Multi-Behavior Correlation Confirmed!");
+                            Console.WriteLine($" Real Malware: {exeName} (PID: {root})");
+                            Console.WriteLine($" Detected Actions: {string.Join(", ", processBehaviors[root])}");
+                            Console.WriteLine("=======================================================\n");
+
+                            answerSent = true;
+                            _ = SendAnswerToServer(JsonConvert.SerializeObject(new { answer = exeName, secret = SECRET }));
+                        }
                     }
+                    break; // Stop backtracking, we found the owner
+                }
+
+                // Move up tree
+                int parentId;
+                bool hasParent;
+                lock (childToParent) { hasParent = childToParent.TryGetValue(root, out parentId); }
+                if (!hasParent || parentId == root || parentId == 0) break;
+                root = parentId;
+            }
+        }
+
+        private static void fileReadHandler(FileIOReadWriteTraceData data)
+        {
+            try
+            {
+                if (answerSent || string.IsNullOrEmpty(TargetFileId)) return;
+
+                // Check File ID (bypasses Hard Links)
+                string currentFileId = FileIdHelper.GetUniqueFileId(data.FileName);
+
+                if (!string.IsNullOrEmpty(currentFileId) && currentFileId == TargetFileId)
+                {
+                    RecordAndCheckMalware(data.ProcessID, BehaviorType.FileAccess, $"Read File: {data.FileName}");
                 }
             }
+            catch { }
+        }
+
+        private static void registryOpenHandler(RegistryTraceData data)
+        {
+            try
+            {
+                if (answerSent) return;
+                if (!string.IsNullOrEmpty(data.KeyName) && data.KeyName.ToUpper().Contains("SOFTWARE\\BOMBE"))
+                {
+                    RecordAndCheckMalware(data.ProcessID, BehaviorType.RegistryAccess, $"Opened Key: {data.KeyName}");
+                }
+            }
+            catch { }
+        }
+
+        // --- Helpers (Process Tracking, etc.) ---
+
+        private static bool IsTargetMalwareProcess(string imageNameOrPath)
+        {
+            if (string.IsNullOrEmpty(imageNameOrPath)) return false;
+            return Path.GetFileName(imageNameOrPath).StartsWith("BOMBE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void imageLoadHandler(ImageLoadTraceData data)
+        {
+            if (!data.FileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
+            lock (processToImagePath)
+            {
+                if (processToImagePath.TryGetValue(data.ProcessID, out string existing))
+                    if (!string.IsNullOrEmpty(existing) && existing.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
+
+                lock (processIdToExeName)
+                {
+                    if (processIdToExeName.TryGetValue(data.ProcessID, out string shortName) &&
+                        !string.IsNullOrEmpty(shortName) && data.FileName.EndsWith(shortName, StringComparison.OrdinalIgnoreCase))
+                        processToImagePath[data.ProcessID] = data.FileName;
+                    else
+                        processToImagePath[data.ProcessID] = data.FileName;
+                }
+            }
+        }
+
+        private static async void processStartedHandler(ProcessTraceData data)
+        {
+            lock (processIdToExeName) { processIdToExeName[data.ProcessID] = data.ImageFileName; }
+            lock (childToParent) { childToParent[data.ProcessID] = data.ParentID; }
         }
 
         private static void processStoppedHandler(ProcessTraceData data)
         {
-            lock (processIdToExeName)
-            {
-                processIdToExeName.Remove(data.ProcessID);
-            }
-        }
-
-        private static async void fileReadHandler(FileIOReadWriteTraceData data)
-        {
-            // Check if the answer has already been sent
-            if (answerSent) return;
-
-            // Define the full path to the target file
-            string targetFilePath = ("C:\\Users\\bombe\\AppData\\Local\\bhrome\\Login Data").ToLower();
-
-            if (data.FileName.ToLower().Equals(targetFilePath))
-            {
-                string exeName = null;
-                lock (processIdToExeName)
-                {
-                    processIdToExeName.TryGetValue(data.ProcessID, out exeName);
-                }
-
-                if (exeName == null || !exeName.StartsWith("BOMBE")) return;
-
-                Console.WriteLine("File read: {0}, process: {1} with pid {2}, exe: {3}", data.FileName, data.ProcessName, data.ProcessID, exeName);
-
-                // Send the executable filename to the server
-                if (!string.IsNullOrEmpty(exeName))
-                {
-                    await SendAnswerToServer(JsonConvert.SerializeObject(
-                        new
-                        {
-                            answer = exeName,
-                            secret = SECRET
-                        }
-                    ));
-
-                    // Set the flag to true to disable further handling
-                    answerSent = true;
-                }
-            }
+            lock (processIdToExeName) { processIdToExeName.Remove(data.ProcessID); }
+            // Optional: Remove from tracking to free memory, but beware if events come in late
+            lock (processBehaviors) { processBehaviors.Remove(data.ProcessID); }
         }
 
         private static async Task SendAnswerToServer(string jsonPayload)
         {
             using (HttpClient client = new HttpClient())
             {
-                StringContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
                 try
                 {
+                    StringContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
                     HttpResponseMessage response = await client.PostAsync("https://submit.bombe.top/submitEdrAns", content);
                     response.EnsureSuccessStatusCode();
-                    string responseBody = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($"Response: {responseBody}");
+                    Console.WriteLine($"[Server] {await response.Content.ReadAsStringAsync()}");
                 }
-                catch (HttpRequestException e)
-                {
-                    Console.WriteLine($"Request error: {e.Message}");
-                }
+                catch (Exception e) { Console.WriteLine($"[Network Error] {e.Message}"); }
             }
         }
     }
